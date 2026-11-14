@@ -1,0 +1,227 @@
+QWEN CHAT - OFFLINE AI CHAT FOR ANDROID - SETUP AND USAGE
+=========================================================
+
+This guide takes you from your PC to chatting with Qwen on the Vivo Y27.
+The app runs the AI model on the phone itself: no internet, no account, no server.
+
+IMPORTANT: The APK has never been built yet. The first GitHub build is the first real test,
+so it may fail. Section 10 explains what to do then.
+
+
+1. WHAT YOU NEED
+----------------
+    - A GitHub account (github.com)
+    - Git for Windows (git-scm.com) - install with the default options
+    - A USB cable, to copy the APK to the phone (or download it on the phone directly)
+    - About 2.5 GB of free storage on the Vivo Y27
+
+GitHub Actions minutes:
+    - Public repositories: free, no limit.
+    - Private repositories: 2,000 free minutes a month. The first build takes roughly 45-75
+      minutes and later builds less, so that's about 25 or more builds a month.
+
+
+2. PUT THE PROJECT ON GITHUB
+----------------------------
+Step 1 - Create the repository
+    On github.com click  + -> New repository
+    Name it (e.g. qwen-chat), choose Public or Private, and do NOT add a README.
+    Click "Create repository".
+
+Step 2 - Upload the project. Open PowerShell and run
+         (replace <you> and <repo> with your GitHub name and repository name):
+
+    cd D:\PythonProject\QwenChat-Android
+    git init
+    git add .
+    git commit -m "Offline Qwen chat"
+    git branch -M main
+    git remote add origin https://github.com/<you>/<repo>.git
+    git push -u origin main
+
+    If git asks who you are, run these two lines, then repeat the commit:
+        git config --global user.name "Your Name"
+        git config --global user.email "you@example.com"
+
+    On the first push a browser window opens to sign in to GitHub.
+
+Step 3 - Check it on GitHub
+    You should see: .github/workflows/build-apk.yml, native/, main.py and buildozer.spec
+
+    Do NOT drag-and-drop the files through the GitHub website: Windows Explorer can leave out the
+    hidden .github folder, and then nothing builds.
+
+    Do NOT add the .gguf model to the repository. GitHub rejects files over 100 MB.
+    The build downloads the model itself.
+
+
+3. BUILD THE APK
+----------------
+Pushing starts the build automatically.
+
+    Open your repository -> Actions tab -> "Build APK" -> click the running build.
+
+The steps:
+    - prepares the build machine and downloads the Android NDK      (about 5 minutes)
+    - compiles llama.cpp for the phone's CPU                         (about 10 minutes)
+    - downloads the Qwen model, 1.1 GB                               (about 1-2 minutes)
+    - builds the APK with buildozer    (30-60 minutes the first time, much faster later)
+    - uploads the APK
+
+    Green check = it worked.
+    Red X       = a step failed - see section 10.
+
+To choose a different model:
+    Actions -> Build APK -> "Run workflow" -> pick one:
+        qwen2.5-1.5b   the default. Better answers, about 4-6 tokens/s (estimated)
+        qwen2.5-0.5b   half the size, about 10-15 tokens/s (estimated), weaker answers
+        none           no model inside the APK - you copy one to the phone yourself (section 7)
+
+
+4. DOWNLOAD THE APK
+-------------------
+    1. Open the finished run -> scroll down to "Artifacts" -> click "qwen-chat-apk".
+       It is a zip of about 1.1 GB, and you must be signed in to GitHub.
+    2. Unzip it. Inside is:  qwenchat-1.0-arm64-v8a-debug.apk
+
+
+5. INSTALL IT ON THE VIVO Y27
+-----------------------------
+    1. Connect the phone with USB -> on the phone choose "File transfer"
+       -> copy the APK into the Download folder.
+    2. On the phone, open File Manager -> Download -> tap the APK.
+    3. If Android blocks it: tap Settings, turn on "Allow from this source" for File Manager,
+       go back and tap Install.
+    4. Vivo or Google Play Protect may warn about an unknown app.
+       Choose "More details" -> "Install anyway".
+       The app has no internet permission, so it can't send anything anywhere.
+
+Updating later:
+    Install the new APK the same way - it replaces the old app.
+    If you ever see "App not installed" or "package conflicts", uninstall Qwen Chat first.
+    That happens if GitHub has thrown away the saved signing key, which it does after 7 days
+    without a build.
+
+
+6. USING THE APP
+----------------
+First start:
+    Android unpacks the 1.1 GB model, which takes about a minute. Then the status line under
+    "Qwen" shows "loading model..." and finally "online - offline model".
+    After that, the app starts in a few seconds.
+
+    Send         type in the Message box and tap Send - the reply appears word by word
+    Stop         the red button while it is answering - ends the reply early
+    New          top right - starts a fresh conversation and frees the chat's memory
+
+The status line shows speed and context use after each reply, e.g.:
+        5.2 tokens/s - context 34%
+    "oldest messages forgotten" means the chat outgrew the model's memory, so the oldest
+    messages were dropped.
+
+Yellow notes are messages from the app itself (for example low memory or a reduced context).
+
+Everything works in airplane mode.
+
+Tips:
+    - Close heavy apps (games, the camera) before long chats. The app uses about 1.4 GB.
+    - Long chats get slower as the context fills. Tap New when you change topic.
+    - Small models make mistakes - double-check anything important.
+
+
+7. USING YOUR OWN MODEL (optional, no rebuild needed)
+-----------------------------------------------------
+    1. Open the app once, so Android creates its folder.
+    2. Connect the phone to the PC by USB and choose "File transfer". On the PC, open:
+           This PC -> Vivo Y27 -> Internal storage -> Android -> data
+               -> org.offlineai.qwenchat -> files
+    3. Copy a .gguf file there, e.g. qwen2.5-0.5b-instruct-q4_k_m.gguf
+       from huggingface.co/Qwen. A model in this folder takes priority over the one inside the APK.
+    4. Close the app completely (swipe it away from recent apps) and open it again.
+
+Stick to Qwen Instruct models in GGUF format, Q4_K_M, 1.5B or smaller. Bigger models exceed the
+2 GB memory budget, and the app will shrink its context or warn you.
+
+
+8. CHANGING SETTINGS
+--------------------
+Settings are at the top of main.py:
+
+    N_THREADS = 4            threads while generating - try 3 or 5 and compare the tokens/s
+    N_THREADS_BATCH = 6      threads while reading your message
+    N_CTX = 2048             how much chat the model remembers
+    MAX_REPLY_TOKENS = 512   longest reply
+    TEMPERATURE = 0.7        lower = more focused, higher = more creative
+    SYSTEM_PROMPT = "..."    the assistant's personality and instructions
+
+After editing, push the change to start a new build:
+
+    git add main.py
+    git commit -m "Change settings"
+    git push
+
+Then download and install the new APK as in sections 4 and 5.
+
+
+9. PREVIEWING THE UI ON YOUR PC (optional)
+------------------------------------------
+    cd D:\PythonProject\QwenChat-Android
+    ..\.venv\Scripts\python.exe main.py
+
+Kivy is already installed in your .venv. Without the phone library it runs in DEMO MODE,
+echoing what you type, so you can see layout changes before building.
+
+
+10. IF SOMETHING GOES WRONG
+---------------------------
+THE GITHUB BUILD FAILS (red X):
+    1. Click the failed run -> click the step with the red X -> scroll to the first red lines.
+    2. Copy roughly the last 50 lines of that step and send them to Claude to fix.
+    3. The most likely steps to fail the first time are "Build llama.cpp" (the C++ bridge has
+       never been compiled) and "Build APK with buildozer".
+    4. After a fix is pushed, the build starts again by itself.
+       To retry without changes, click "Re-run jobs".
+
+THE APP CLOSES RIGHT AWAY, OR SHOWS AN ERROR - get its log from the phone:
+    1. On the phone: Settings -> About phone -> Software version
+       -> tap "Version" (or "Build number") 7 times. Developer options are now unlocked.
+    2. Settings -> System management -> Developer options -> turn on "USB debugging".
+    3. On the PC, download "SDK Platform-Tools" for Windows from
+           developer.android.com/tools/releases/platform-tools
+       and unzip it, e.g. to C:\platform-tools
+    4. Connect the phone and accept the "Allow USB debugging?" prompt, then run in PowerShell:
+           cd C:\platform-tools
+           .\adb logcat -c
+           .\adb logcat -s python llama
+    5. Open the app, reproduce the problem, and send the output to Claude.
+
+OTHER PROBLEMS:
+    "No model file found"
+        You built with "none": copy a model in as in section 7, or rebuild with a model.
+
+    "Could not load the model"
+        The .gguf file is damaged or isn't a GGUF model - copy it again.
+
+    Low-memory note, or the app gets closed
+        Close other apps, or switch to the 0.5B model.
+
+    Slow (under 3 tokens/s)
+        The phone may be hot - let it cool. Try N_THREADS = 3, or the 0.5B model.
+
+    Keyboard covers the input box, or the header sits under the notch
+        Send the adb logcat output (look for a line containing "safe area").
+
+    Chinese shows as boxes
+        Your phone lacks the usual CJK system font - ask Claude to add another font path.
+
+
+11. PROJECT FILES (reference)
+-----------------------------
+    main.py                           the app: chat UI and the code that runs the model
+    native/chat_bridge.cpp            small C++ layer between Python and llama.cpp
+    native/build_android.sh           compiles llama.cpp for the phone's CPU
+    native/CMakeLists.txt             build settings for the C++ library
+    buildozer.spec                    APK settings: name, Android versions, CPU type
+    .github/workflows/build-apk.yml   the automatic build on GitHub
+    README.md                         technical details: memory, threads, screen fit
+    INSTRUCTIONS.txt                  this file

@@ -1,0 +1,11 @@
+# build outputs
+.buildozer/
+bin/
+libs/
+native/llama.cpp/
+native/build-android/
+model-cache/
+__pycache__/
+
+# models are downloaded by the workflow (GitHub refuses files over 100 MB)
+models/*.gguf

@@ -1,0 +1,162 @@
+name: Build APK
+
+# Every push to main builds a debug APK (with the default model bundled) and attaches it to the run.
+# "Run workflow" on the Actions tab lets you pick another model, or none.
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Model bundled into the APK"
+        type: choice
+        default: qwen2.5-1.5b
+        options:
+          - qwen2.5-1.5b   # ~1.1 GB, better answers, ~4-6 tokens/s on a Helio G85
+          - qwen2.5-0.5b   # ~0.5 GB, faster (~10-15 tokens/s), weaker answers
+          - none           # no model inside; copy one to the phone yourself (see README)
+
+env:
+  LLAMA_TAG: b11963          # llama.cpp release native/chat_bridge.cpp is written against
+  NDK_VERSION: r28c          # same NDK for llama.cpp and python-for-android
+  DEFAULT_MODEL: qwen2.5-1.5b
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+
+    steps:
+      - name: Free disk space
+        # The SDK, NDK, python-for-android builds and a 1 GB model don't fit the default free space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force > /dev/null || true
+          df -h /
+
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"   # runs buildozer; the app itself gets Python 3.14 from python-for-android
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install build dependencies
+        # Same list as python-for-android's own Dockerfile
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -qq -y --no-install-recommends \
+            ant autoconf automake autopoint ccache cmake g++ gcc git lbzip2 libffi-dev libltdl-dev \
+            libtool libssl-dev make patch pkg-config unzip wget zip zlib1g-dev libncurses-dev
+          pip install --upgrade pip
+          pip install "buildozer==1.6.0"
+
+      # ---- Android NDK (used for llama.cpp AND by buildozer) ---------------------------------
+      - name: Cache Android NDK
+        id: ndk-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/android-ndk-${{ env.NDK_VERSION }}
+          key: ndk-${{ env.NDK_VERSION }}
+
+      - name: Download Android NDK
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
+        run: |
+          wget -q "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip" -O /tmp/ndk.zip
+          unzip -q /tmp/ndk.zip -d ~
+          rm /tmp/ndk.zip
+
+      - name: Point builds at the NDK
+        run: |
+          echo "ANDROID_NDK=$HOME/android-ndk-${NDK_VERSION}" >> "$GITHUB_ENV"
+          # buildozer reads APP_<KEY> environment variables as overrides of buildozer.spec [app] keys
+          echo "APP_ANDROID_NDK_PATH=$HOME/android-ndk-${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      # ---- llama.cpp -> libs/arm64-v8a/libchatbridge.so --------------------------------------
+      - name: Cache native library
+        id: native-cache
+        uses: actions/cache@v4
+        with:
+          path: libs/arm64-v8a
+          key: chatbridge-${{ env.LLAMA_TAG }}-${{ env.NDK_VERSION }}-${{ hashFiles('native/**') }}
+
+      - name: Build llama.cpp for arm64-v8a with the NDK
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        run: LLAMA_TAG="$LLAMA_TAG" bash native/build_android.sh
+
+      # ---- model ----------------------------------------------------------------------------------
+      - name: Choose model
+        id: model
+        run: |
+          MODEL="${{ github.event.inputs.model }}"
+          MODEL="${MODEL:-$DEFAULT_MODEL}"
+          case "$MODEL" in
+            qwen2.5-1.5b) FILE=qwen2.5-1.5b-instruct-q4_k_m.gguf
+                          URL=https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/$FILE ;;
+            qwen2.5-0.5b) FILE=qwen2.5-0.5b-instruct-q4_k_m.gguf
+                          URL=https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/$FILE ;;
+            none)         FILE=""; URL="" ;;
+            *) echo "Unknown model $MODEL"; exit 1 ;;
+          esac
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "Bundling: ${FILE:-no model}"
+
+      - name: Cache model
+        if: steps.model.outputs.file != ''
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: model-cache
+          key: model-${{ steps.model.outputs.file }}
+
+      - name: Download model
+        if: steps.model.outputs.file != ''
+        run: |
+          mkdir -p models model-cache
+          FILE="${{ steps.model.outputs.file }}"
+          if ls models/*.gguf > /dev/null 2>&1; then
+            echo "models/ already has a .gguf from the repository - using it"
+            exit 0
+          fi
+          if [ ! -f "model-cache/$FILE" ]; then
+            curl -L --fail --retry 3 -o "model-cache/$FILE" "${{ steps.model.outputs.url }}"
+          fi
+          cp "model-cache/$FILE" "models/$FILE"
+          ls -lh models
+
+      # ---- APK ------------------------------------------------------------------------------------
+      - name: Cache buildozer (Android SDK, python-for-android builds)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.buildozer
+            .buildozer
+          key: buildozer-${{ env.NDK_VERSION }}-${{ hashFiles('buildozer.spec') }}
+
+      - name: Cache debug signing key
+        # Gradle creates ~/.android/debug.keystore on the first build. Keeping it means every APK is
+        # signed with the same key, so a new build installs over the old one (Android refuses an update
+        # signed with a different key). Fixed cache key: it never changes between builds.
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: android-debug-keystore-v1
+
+      - name: Build APK with buildozer
+        run: |
+          test -f libs/arm64-v8a/libchatbridge.so
+          yes | buildozer -v android debug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: qwen-chat-apk
+          path: bin/*.apk
+          compression-level: 0    # the model doesn't compress; zipping it again only costs time
+          retention-days: 14

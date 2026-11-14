@@ -1,0 +1,8 @@
+# The APK's own Python packages are listed in buildozer.spec (requirements = python3,kivy,pyjnius,android).
+# This file is for working on the PC:
+
+# Desktop preview of the UI - "python main.py" runs in demo mode without the native library
+kivy==2.3.1
+
+# Builds the APK (Linux / WSL / GitHub Actions only - buildozer doesn't run on Windows)
+buildozer==1.6.0; sys_platform == "linux"
