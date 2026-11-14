@@ -12,6 +12,7 @@ import gc
 import glob
 import os
 import queue
+import re
 import threading
 import time
 
@@ -58,7 +59,9 @@ TOP_K = 20
 REPEAT_PENALTY = 1.05
 
 SYSTEM_PROMPT = ("You are Qwen, created by Alibaba Cloud. You are a helpful assistant. "
-                 "Keep answers short and clear unless the user asks for detail.")
+                 "Keep answers short and clear unless the user asks for detail. "
+                 "Write math as plain text with Unicode symbols, like x² + 3x = 10, √2, ½, π, ≤, "
+                 "never LaTeX.")
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 BUNDLED_MODEL_DIR = os.path.join(APP_DIR, "models")   # the GitHub workflow downloads the model here
@@ -277,6 +280,153 @@ def chatml(messages):
         parts.append(f"<|im_start|>{message['role']}\n{clean(message['content'])}<|im_end|>\n")
     parts.append("<|im_start|>assistant\n")
     return "".join(parts)
+
+
+# ==== math: LaTeX -> readable text ============================================================
+# Qwen writes math as LaTeX (\frac{1}{2}, x^2, \( ... \)), which websites render as equations.
+# Kivy labels only show plain text, so the common commands become Unicode: ½ x² √ × ≤ π Σ ...
+
+SUPERSCRIPT = dict(zip("0123456789+-=()ni", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿⁱ"))
+SUBSCRIPT = dict(zip("0123456789+-=()", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎"))
+FRACTIONS = {("1", "2"): "½", ("1", "3"): "⅓", ("2", "3"): "⅔", ("1", "4"): "¼", ("3", "4"): "¾",
+             ("1", "5"): "⅕", ("1", "6"): "⅙", ("1", "8"): "⅛"}
+LATEX_SYMBOLS = {
+    "times": "×", "cdot": "·", "div": "÷", "pm": "±", "mp": "∓", "ast": "*",
+    "leq": "≤", "le": "≤", "geq": "≥", "ge": "≥", "neq": "≠", "ne": "≠", "approx": "≈", "equiv": "≡",
+    "sim": "~", "propto": "∝", "ll": "≪", "gg": "≫",
+    "infty": "∞", "partial": "∂", "nabla": "∇", "sum": "Σ", "prod": "∏", "int": "∫", "oint": "∮",
+    "to": "→", "rightarrow": "→", "leftarrow": "←", "Rightarrow": "⇒", "implies": "⇒",
+    "Leftarrow": "⇐", "Leftrightarrow": "⇔", "iff": "⇔", "leftrightarrow": "↔", "mapsto": "↦",
+    "in": "∈", "notin": "∉", "ni": "∋", "subset": "⊂", "subseteq": "⊆", "supset": "⊃", "supseteq": "⊇",
+    "cup": "∪", "cap": "∩", "emptyset": "∅", "varnothing": "∅", "forall": "∀", "exists": "∃",
+    "neg": "¬", "land": "∧", "wedge": "∧", "lor": "∨", "vee": "∨", "angle": "∠", "perp": "⊥",
+    "parallel": "∥", "triangle": "△", "circ": "∘", "degree": "°", "therefore": "∴", "because": "∵",
+    "ldots": "…", "cdots": "⋯", "dots": "…", "prime": "′", "mid": "|",
+    "alpha": "α", "beta": "β", "gamma": "γ", "delta": "δ", "epsilon": "ε", "varepsilon": "ε",
+    "zeta": "ζ", "eta": "η", "theta": "θ", "vartheta": "θ", "iota": "ι", "kappa": "κ", "lambda": "λ",
+    "mu": "μ", "nu": "ν", "xi": "ξ", "pi": "π", "rho": "ρ", "sigma": "σ", "tau": "τ", "upsilon": "υ",
+    "phi": "φ", "varphi": "φ", "chi": "χ", "psi": "ψ", "omega": "ω",
+    "Gamma": "Γ", "Delta": "Δ", "Theta": "Θ", "Lambda": "Λ", "Xi": "Ξ", "Pi": "Π", "Sigma": "Σ",
+    "Phi": "Φ", "Psi": "Ψ", "Omega": "Ω",
+    "quad": "  ", "qquad": "    ", "displaystyle": "", "left": "", "right": "", "big": "", "Big": "",
+    "bigg": "", "Bigg": "", "limits": "", "nolimits": "",
+}
+for _name in ("sin", "cos", "tan", "cot", "sec", "csc", "arcsin", "arccos", "arctan", "sinh", "cosh",
+              "tanh", "log", "ln", "lg", "exp", "lim", "max", "min", "sup", "inf", "det", "gcd", "lcm",
+              "mod", "deg", "dim", "ker", "arg"):
+    LATEX_SYMBOLS[_name] = _name
+LATEX_SYMBOLS["bmod"] = "mod"
+LATEX_SYMBOLS["pmod"] = "mod"
+
+_GROUP = r"\{([^{}]*)\}"  # innermost {...}: the loop below works from the inside out
+_SYMBOL_RE = re.compile(r"\\([A-Za-z]+)(?![A-Za-z])")
+_MATH_RE = re.compile(r"\\\[(.*?)(?:\\\]|$)|\$\$(.*?)(?:\$\$|$)|\\\((.*?)(?:\\\)|$)|\$([^$\n]+?)\$", re.S)
+
+
+def _simple(text):
+    """True when text needs no parentheses in a fraction or root: 12, x, 2x, x², π."""
+    return bool(re.fullmatch(r"[\w.²³¹⁰⁴-⁹′]+|.", text.strip()))
+
+
+def _wrap(text):
+    text = text.strip()
+    return text if _simple(text) else f"({text})"
+
+
+def _script(text, table, mark):
+    text = text.strip()
+    if text and all(char in table for char in text):
+        return "".join(table[char] for char in text)
+    mark = "\x05" if mark == "^" else "\x06"  # restored as ^ / _ at the end, so they aren't converted again
+    return mark + (text if len(text) == 1 else f"({text})")
+
+
+def _fraction(match):
+    top, bottom = match.group(1).strip(), match.group(2).strip()
+    if (top, bottom) in FRACTIONS:
+        return FRACTIONS[(top, bottom)]
+    # a/2x would read as (a/2)·x, so a denominator is bare only when it is one number or symbol
+    bottom = bottom if re.fullmatch(r"[\d.]+|.", bottom) else f"({bottom})"
+    return f"{_wrap(top)}/{bottom}"
+
+
+def _root(match):
+    degree, body = (match.group(1) or "").strip(), match.group(2)
+    sign = {"": "√", "2": "√", "3": "∛", "4": "∜"}.get(degree)
+    if sign is None:
+        sign = _script(degree, SUPERSCRIPT, "^") + "√"
+    return sign + _wrap(body)
+
+
+def _bounds(match):
+    name, low, high = match.group(1), match.group(2), match.group(3) or match.group(4)
+    sign = {"sum": "Σ", "prod": "∏", "lim": "lim"}[name]
+    if all(char in SUBSCRIPT for char in low.strip()) and (not high or all(c in SUPERSCRIPT for c in high.strip())):
+        return match.group(0)  # fits as small numbers: the general rules make Σ₁ⁿ
+    return f"{sign}({low.strip()}..{high.strip()}) " if high else f"{sign}({low.strip()}) "
+
+
+def _convert(math, full):
+    """
+    Converts LaTeX commands to Unicode. full=True inside math delimiters: also ^ _ { } & and \\\\.
+    Outside them only backslash commands change, so code like a^b or my_var stays as it is.
+    """
+    math = (math.replace(r"\{", "\x01").replace(r"\}", "\x02").replace(r"\%", "%").replace(r"\$", "$")
+            .replace(r"\&", "\x03").replace(r"\#", "#").replace(r"\_", "\x04"))
+    if full:
+        math = re.sub(r"\\\\(\[[^\]]*\])?", "\n", math)  # \\ (optionally \\[2pt]): new line
+    math = re.sub(r"\\begin\{[a-z*]+\}(\{[^{}]*\})?|\\end\{[a-z*]+\}", "", math)
+    math = re.sub(r"\\[,;:!> ]", lambda m: "" if m.group(0) == r"\!" else " ", math)
+    math = re.sub(r"\^\s*\{?\s*\\circ\s*\}?", "°", math)
+    math = re.sub(r"\\mathbb\s*\{?\s*([RNZQC])\s*\}?", lambda m: "ℝℕℤℚℂ"["RNZQC".index(m.group(1))], math)
+    if full:
+        math = re.sub(r"\\(sum|prod|lim)\s*_\s*" + _GROUP + r"(?:\s*\^\s*(?:" + _GROUP + r"|(\w)))?", _bounds, math)
+    math = re.sub(r"\\[dt]?frac\s*(\d)\s*(\d)", r"\\frac{\1}{\2}", math)  # \frac12
+    for _ in range(12):  # nested groups: innermost first
+        before = math
+        math = re.sub(r"\\[dt]?frac\s*" + _GROUP + r"\s*" + _GROUP, _fraction, math)
+        math = re.sub(r"\\[dt]?binom\s*" + _GROUP + r"\s*" + _GROUP, r"C(\1, \2)", math)
+        math = re.sub(r"\\sqrt\s*(?:\[([^\]]*)\])?\s*" + _GROUP, _root, math)
+        math = re.sub(r"\\(?:text|textbf|textit|mathrm|mathbf|mathit|mathsf|mathbb|mathcal|operatorname"
+                      r"|vec|hat|bar|overline|underline|tilde|dot|ddot|mbox)\s*" + _GROUP, r"\1", math)
+        math = re.sub(r"\\boxed\s*" + _GROUP, r"**\1**", math)
+        if full:
+            math = re.sub(r"\^\s*" + _GROUP, lambda m: _script(m.group(1), SUPERSCRIPT, "^"), math)
+            math = re.sub(r"_\s*" + _GROUP, lambda m: _script(m.group(1), SUBSCRIPT, "_"), math)
+        if math == before:
+            break
+    math = _SYMBOL_RE.sub(lambda m: LATEX_SYMBOLS.get(m.group(1), m.group(0)), math)
+    if full:
+        math = re.sub(r"\^\s*([^\s{}\\])", lambda m: _script(m.group(1), SUPERSCRIPT, "^"), math)
+        math = re.sub(r"_\s*([^\s{}\\])", lambda m: _script(m.group(1), SUBSCRIPT, "_"), math)
+        math = math.replace("&", "").replace("{", "").replace("}", "")
+    if full:
+        math = re.sub(r" *\n *", "\n", re.sub(r" {2,}", " ", math))
+    return (math.replace("\x01", "{").replace("\x02", "}").replace("\x03", "&").replace("\x04", "_")
+            .replace("\x05", "^").replace("\x06", "_"))
+
+
+def _looks_like_math(text):
+    return bool(re.search(r"[\\^_=+]", text)) and not re.fullmatch(r"\s*\d[\d,.]*\s*", text)
+
+
+def latex_to_text(text):
+    """Makes LaTeX math in a reply readable as plain text. Code blocks (```) are left untouched."""
+    if "\\" not in text and "$" not in text:
+        return text
+    parts = text.split("```")
+    for i in range(0, len(parts), 2):  # even parts are outside code blocks
+        def math_region(match):
+            display = match.group(1) is not None or match.group(2) is not None
+            body = next(group for group in match.groups() if group is not None)
+            if match.group(4) is not None and not _looks_like_math(body):
+                return match.group(0)  # "$5 and $10": money, not math
+            converted = _convert(body, True).strip()
+            return f"\n{converted}\n" if display else converted
+        part = _MATH_RE.sub(math_region, parts[i])
+        part = _convert(part, False)
+        parts[i] = re.sub(r"\n{3,}", "\n\n", part)
+    return "```".join(parts)
 
 
 class ChatEngine:
@@ -498,14 +648,16 @@ def pick_font():
 
 
 CJK_FONT = pick_font()
-CJK_RANGES = ((0x2E80, 0x9FFF), (0xAC00, 0xD7AF), (0xF900, 0xFAFF), (0xFF00, 0xFFEF))
+CJK_RANGES = ((0x2E80, 0x9FFF), (0xAC00, 0xD7AF), (0xF900, 0xFAFF), (0xFF00, 0xFFEF),
+              (0x2070, 0x23FF))  # also small numbers, letterlike symbols, arrows and math (² ₁ ℝ → ∫ ≤)
 
 
 def font_for(text):
-    # Roboto (which has a real bold face) unless the text contains Chinese / Japanese / Korean
+    # Roboto (which has a real bold face) unless the text contains Chinese / Japanese / Korean or
+    # math symbols that Kivy's Roboto doesn't have; the system CJK font covers both
     for char in text:
         code = ord(char)
-        if code >= 0x2E80 and any(low <= code <= high for low, high in CJK_RANGES):
+        if code >= 0x2070 and any(low <= code <= high for low, high in CJK_RANGES):
             return CJK_FONT
     return "Roboto"
 
@@ -654,6 +806,7 @@ class Bubble(BoxLayout):
         self.background.pos, self.background.size = self.box.pos, self.box.size
 
     def set_text(self, text):
+        text = latex_to_text(text)
         self.raw_text = text
         self.label.font_name = font_for(text)
         self.label.text = to_markup(text) if text else "..."
