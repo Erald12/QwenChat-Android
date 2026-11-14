@@ -10,6 +10,7 @@ import codecs
 import ctypes
 import gc
 import glob
+import json
 import os
 import queue
 import re
@@ -58,7 +59,7 @@ TOP_P = 0.8
 TOP_K = 20
 REPEAT_PENALTY = 1.05
 
-SYSTEM_PROMPT = ("You are Qwen, created by Alibaba Cloud. You are a helpful assistant. "
+SYSTEM_PROMPT = ("You are Erald Bot, a helpful assistant that runs offline on this phone. "
                  "Keep answers short and clear unless the user asks for detail. "
                  "Write math as plain text with Unicode symbols, like x² + 3x = 10, √2, ½, π, ≤, "
                  "never LaTeX.")
@@ -98,16 +99,156 @@ def external_model_dir():
     return BUNDLED_MODEL_DIR
 
 
-def find_model():
-    """
-    Returns the path of the model to load: a .gguf in the external folder wins over the bundled one.
-    """
+# Models that work with this app: all use the ChatML chat format that chatml() writes.
+# Q4_K_M is the best size / quality balance for a phone. Sizes are the exact file sizes in bytes.
+HF = "https://huggingface.co/"
+MODELS = [
+    {"name": "Qwen2.5 1.5B", "about": "Best all-round answers",
+     "file": "qwen2.5-1.5b-instruct-q4_k_m.gguf", "size": 1117320736,
+     "url": HF + "Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf"},
+    {"name": "Qwen2.5 0.5B", "about": "2-3x faster, simpler answers",
+     "file": "qwen2.5-0.5b-instruct-q4_k_m.gguf", "size": 491400032,
+     "url": HF + "Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf"},
+    {"name": "Qwen2.5 Math 1.5B", "about": "Math problems, step by step",
+     "file": "Qwen2.5-Math-1.5B-Instruct-Q4_K_M.gguf", "size": 986048832,
+     "url": HF + "bartowski/Qwen2.5-Math-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-Math-1.5B-Instruct-Q4_K_M.gguf"},
+    {"name": "Qwen2.5 Coder 1.5B", "about": "Programming and code",
+     "file": "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf", "size": 1117320768,
+     "url": HF + "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"},
+    {"name": "SmolLM2 1.7B", "about": "English chat, by Hugging Face",
+     "file": "smollm2-1.7b-instruct-q4_k_m.gguf", "size": 1055609536,
+     "url": HF + "HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF/resolve/main/smollm2-1.7b-instruct-q4_k_m.gguf"},
+    {"name": "SmolLM2 360M", "about": "Tiny and very fast, basic answers",
+     "file": "SmolLM2-360M-Instruct-Q4_K_M.gguf", "size": 270590880,
+     "url": HF + "bartowski/SmolLM2-360M-Instruct-GGUF/resolve/main/SmolLM2-360M-Instruct-Q4_K_M.gguf"},
+]
+
+
+def model_path(model):
+    """Where this model's file is on the phone (downloaded or bundled in the APK), or None."""
+    for folder in (external_model_dir(), BUNDLED_MODEL_DIR):
+        if folder:
+            path = os.path.join(folder, model["file"])
+            if os.path.isfile(path):
+                return path
+    return None
+
+
+def model_name(path):
+    """Display name for a model file: the catalog name, or the file name for your own .gguf."""
+    file = os.path.basename(path or "")
+    return next((m["name"] for m in MODELS if m["file"] == file), file.replace(".gguf", "") or "demo")
+
+
+def settings_path():
+    folder = external_model_dir()
+    return os.path.join(folder, "settings.json") if folder else None
+
+
+def load_settings():
+    try:
+        with open(settings_path(), encoding="utf-8") as file:
+            return json.load(file)
+    except (OSError, TypeError, ValueError):
+        return {}
+
+
+def save_settings(**changes):
+    path = settings_path()
+    if not path:
+        return
+    settings = load_settings()
+    settings.update(changes)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as file:
+            json.dump(settings, file)
+    except OSError as e:
+        print(f"[QwenChat] could not save settings: {e}")
+
+
+def all_model_files():
+    """Every .gguf on the phone: downloaded / copied (external folder) first, then the bundled one."""
+    files = []
     for folder in (external_model_dir(), BUNDLED_MODEL_DIR):
         if folder and os.path.isdir(folder):
-            models = sorted(glob.glob(os.path.join(folder, "*.gguf")))
-            if models:
-                return models[0]
-    return None
+            files += sorted(glob.glob(os.path.join(folder, "*.gguf")))
+    return files
+
+
+def find_model():
+    """
+    The model to load: the one chosen in the Models menu, else the first catalog model on the phone,
+    else any other .gguf (one you copied over USB).
+    """
+    chosen = load_settings().get("model")
+    files = all_model_files()
+    for path in files:
+        if os.path.basename(path) == chosen:
+            return path
+    for model in MODELS:
+        path = model_path(model)
+        if path:
+            return path
+    return files[0] if files else None
+
+
+def free_storage_bytes(folder):
+    try:
+        stat = os.statvfs(folder)
+        return stat.f_bavail * stat.f_frsize
+    except (OSError, AttributeError):
+        return None
+
+
+def download_model(model, on_progress, cancel):
+    """
+    Downloads a model into the external folder (runs on a background thread). Resumes an interrupted
+    download from its .part file. on_progress(done_bytes, total_bytes). Raises on error or cancel.
+    """
+    import ssl
+    import urllib.request
+    folder = external_model_dir()
+    if not folder:
+        raise RuntimeError("no storage folder available")
+    os.makedirs(folder, exist_ok=True)
+    final = os.path.join(folder, model["file"])
+    part = final + ".part"
+    done = os.path.getsize(part) if os.path.exists(part) else 0
+    free = free_storage_bytes(folder)
+    if free is not None and free < model["size"] - done + 200 * 1024 * 1024:
+        raise RuntimeError(f"not enough storage: {model['size'] / 1e9:.1f} GB needed, "
+                           f"{free / 1e9:.1f} GB free")
+    try:  # Android has no CA certificates where Python looks for them: use certifi's
+        import certifi
+        context = ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        context = ssl.create_default_context()
+    request = urllib.request.Request(model["url"], headers={"User-Agent": "offline-chat-android/1.0"})
+    if done:
+        request.add_header("Range", f"bytes={done}-")
+    with urllib.request.urlopen(request, context=context, timeout=30) as response:
+        if done and response.status != 206:  # server ignored the resume: start over
+            done = 0
+        total = done + int(response.headers.get("Content-Length") or 0)
+        with open(part, "ab" if done else "wb") as file:
+            last = 0.0
+            while True:
+                if cancel.is_set():
+                    raise RuntimeError("cancelled")
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                file.write(chunk)
+                done += len(chunk)
+                if time.time() - last > 0.3:
+                    on_progress(done, total)
+                    last = time.time()
+    if done != model["size"]:
+        raise RuntimeError(f"download incomplete ({done} of {model['size']} bytes) - tap Download to resume")
+    os.replace(part, final)
+    on_progress(done, done)
+    return final
 
 
 def process_memory_mb():
@@ -456,7 +597,12 @@ class ChatEngine:
 
     def load(self, path, on_ready, on_error):
         def job():
+            self.ready = False
             try:
+                if self.bridge is not None:  # switching models: unload the old one first, so the
+                    self.bridge.free()       # memory measured below is the new model's alone
+                    self.bridge = None
+                    gc.collect()
                 try:
                     self.bridge = self.bridge_factory()
                 except OSError:
@@ -609,12 +755,13 @@ from kivy.app import App  # noqa: E402
 from kivy.clock import Clock, mainthread  # noqa: E402
 from kivy.core.text import Label as CoreLabel  # noqa: E402
 from kivy.core.window import Window  # noqa: E402
-from kivy.graphics import Color, Ellipse, Rectangle, RoundedRectangle  # noqa: E402
+from kivy.graphics import Color, Ellipse, Line, Rectangle, RoundedRectangle  # noqa: E402
 from kivy.metrics import dp, sp  # noqa: E402
 from kivy.uix.behaviors import ButtonBehavior  # noqa: E402
 from kivy.uix.boxlayout import BoxLayout  # noqa: E402
 from kivy.uix.gridlayout import GridLayout  # noqa: E402
 from kivy.uix.label import Label  # noqa: E402
+from kivy.uix.modalview import ModalView  # noqa: E402
 from kivy.uix.scrollview import ScrollView  # noqa: E402
 from kivy.uix.textinput import TextInput  # noqa: E402
 from kivy.uix.widget import Widget  # noqa: E402
@@ -768,6 +915,151 @@ class RoundButton(ButtonBehavior, Label):
         self.fill_color.rgba = color
 
 
+class MicButton(RoundButton):
+    """Round button with a microphone drawn on it (Kivy's font has no microphone symbol)."""
+
+    def __init__(self, color, **kwargs):
+        super().__init__(color, **kwargs)
+        with self.canvas.after:
+            Color(1, 1, 1, 1)
+            self.body = RoundedRectangle()
+            self.cup = Line(width=dp(1.6))
+            self.stem = Line(width=dp(1.6))
+            self.base = Line(width=dp(1.6))
+
+    def _redraw(self, *_):
+        super()._redraw()
+        cx, cy = self.center
+        self.body.pos, self.body.size = (cx - dp(4.5), cy - dp(3)), (dp(9), dp(13))
+        self.body.radius = [dp(4.5)]
+        # U-shaped holder around the bottom of the mic (Kivy angles: 0 = top, clockwise)
+        self.cup.ellipse = (cx - dp(7.5), cy - dp(5), dp(15), dp(14), 90, 270)
+        self.stem.points = [cx, cy - dp(5), cx, cy - dp(9)]
+        self.base.points = [cx - dp(4.5), cy - dp(9), cx + dp(4.5), cy - dp(9)]
+
+
+class PillButton(ButtonBehavior, Label):
+    """Rounded-rectangle button (RoundButton is a circle, too small for words like "Download")."""
+
+    def __init__(self, color, **kwargs):
+        kwargs.setdefault("font_size", sp(13))
+        kwargs.setdefault("bold", True)
+        super().__init__(**kwargs)
+        with self.canvas.before:
+            self.fill_color = Color(*color)
+            self.shape = RoundedRectangle()
+        self.bind(pos=self._redraw, size=self._redraw)
+
+    def _redraw(self, *_):
+        self.shape.pos, self.shape.size = self.pos, self.size
+        self.shape.radius = [min(self.height / 2, dp(18))]
+
+    def set_fill(self, color):
+        self.fill_color.rgba = color
+
+
+class ModelsMenu(ModalView):
+    """
+    Lists the models that work with the app. Each one is downloaded once (then used offline) and
+    can be switched to or deleted. Downloads keep running when the menu is closed.
+    """
+
+    def __init__(self, app, **kwargs):
+        super().__init__(size_hint=(0.94, 0.86), background="", background_color=(0, 0, 0, 0),
+                         overlay_color=(0, 0, 0, 0.5), **kwargs)
+        self.app = app
+        root = BoxLayout(orientation="vertical", padding=dp(14), spacing=dp(10))
+        with root.canvas.before:
+            Color(1, 1, 1, 1)
+            panel = RoundedRectangle(radius=[dp(14)])
+        root.bind(pos=lambda w, _: setattr(panel, "pos", w.pos), size=lambda w, _: setattr(panel, "size", w.size))
+
+        title = Label(text="Models", bold=True, font_size=sp(20), color=TEXT_COLOR,
+                      size_hint_y=None, height=dp(30), halign="left", valign="middle")
+        title.bind(size=lambda w, _: setattr(w, "text_size", w.size))
+        self.info = Label(font_size=sp(12), color=TIME_COLOR, size_hint_y=None, halign="left", valign="top")
+        self.info.bind(width=lambda w, _: setattr(w, "text_size", (w.width, None)),
+                       texture_size=lambda w, size: setattr(w, "height", size[1]))
+        self.rows = GridLayout(cols=1, size_hint_y=None, spacing=dp(8))
+        self.rows.bind(minimum_height=self.rows.setter("height"))
+        scroll = ScrollView(do_scroll_x=False, bar_width=dp(3))
+        scroll.add_widget(self.rows)
+        close = PillButton(SEND_GREEN, text="Close", size_hint_y=None, height=dp(44))
+        close.bind(on_release=lambda *_: self.dismiss())
+        for widget in (title, self.info, scroll, close):
+            root.add_widget(widget)
+        self.add_widget(root)
+        self.row_widgets = {}
+        self.refresh()
+        self.ticker = Clock.schedule_interval(lambda dt: self.update_progress(), 0.5)
+        self.bind(on_dismiss=lambda *_: self.ticker.cancel())
+
+    def refresh(self):
+        """Rebuilds every row (after a download, a switch or a delete)."""
+        folder = external_model_dir()
+        free = free_storage_bytes(folder) if folder else None
+        self.info.text = ("Download a model once, then it works offline. Only the download uses the "
+                          "internet." + (f"  Free storage: {free / 1e9:.1f} GB." if free is not None else ""))
+        self.rows.clear_widgets()
+        self.row_widgets = {}
+        active = os.path.basename(self.app.engine.model_path or "")
+        for model in MODELS:
+            self.rows.add_widget(self.make_row(model, model_path(model), model["file"] == active))
+        # .gguf files you copied yourself (not in the list): can be used, maybe with odd replies
+        known = {m["file"] for m in MODELS}
+        for path in all_model_files():
+            if os.path.basename(path) not in known:
+                own = {"name": os.path.basename(path), "about": "Your own file (must use the ChatML format)",
+                       "file": os.path.basename(path), "size": os.path.getsize(path)}
+                self.rows.add_widget(self.make_row(own, path, own["file"] == active, deletable=False))
+
+    def make_row(self, model, path, active, deletable=True):
+        row = BoxLayout(size_hint_y=None, height=dp(78), padding=(dp(12), dp(8)), spacing=dp(8))
+        with row.canvas.before:
+            Color(*(USER_BUBBLE if active else hex_color("#F0F2F5")))
+            bg = RoundedRectangle(radius=[dp(10)])
+        row.bind(pos=lambda w, _: setattr(bg, "pos", w.pos), size=lambda w, _: setattr(bg, "size", w.size))
+        texts = BoxLayout(orientation="vertical")
+        name = Label(text=model["name"], bold=True, font_size=sp(15), color=TEXT_COLOR, halign="left",
+                     valign="bottom", shorten=True, shorten_from="right")
+        about = Label(text=f"{model['about']} - {model['size'] / 1e9:.1f} GB", font_size=sp(12),
+                      color=TIME_COLOR, halign="left", valign="top", shorten=True, shorten_from="right")
+        for label in (name, about):
+            label.bind(size=lambda w, _: setattr(w, "text_size", w.size))
+            texts.add_widget(label)
+        buttons = BoxLayout(orientation="vertical", size_hint_x=None, width=dp(104), spacing=dp(6))
+        row.add_widget(texts)
+        row.add_widget(buttons)
+
+        def button(text, color, action):
+            widget = PillButton(color, text=text)
+            if action:
+                widget.bind(on_release=lambda *_: action())
+            buttons.add_widget(widget)
+            return widget
+
+        downloading = model["file"] in self.app.downloads
+        if active:
+            button("In use", hex_color("#8696A0"), None)
+        elif path:
+            button("Use", SEND_GREEN, lambda: self.app.switch_model(path))
+            if deletable and path.startswith(external_model_dir() or "\0"):
+                button("Delete", hex_color("#D9534F"), lambda: self.app.delete_model(path))
+        elif downloading:
+            self.row_widgets[model["file"]] = button("...", hex_color("#8696A0"), None)
+            button("Cancel", hex_color("#D9534F"), lambda: self.app.cancel_download(model))
+        elif "url" in model:
+            button("Download", hex_color("#128C7E"), lambda: self.app.start_download(model))
+        return row
+
+    def update_progress(self):
+        for file, widget in self.row_widgets.items():
+            state = self.app.downloads.get(file)
+            if state:
+                done, total = state["progress"]
+                widget.text = f"{done / total:.0%}" if total else "starting"
+
+
 class Bubble(BoxLayout):
     """
     One chat message: a rounded bubble, right-aligned for the user, left-aligned for the bot,
@@ -866,20 +1158,24 @@ class ChatScreen(BoxLayout):
             header_bg = Rectangle()
         header.bind(pos=lambda w, _: setattr(header_bg, "pos", w.pos),
                     size=lambda w, _: setattr(header_bg, "size", w.size))
-        avatar = RoundButton(hex_color("#25D366"), text="Q", bold=True, font_size=sp(20),
+        avatar = RoundButton(hex_color("#25D366"), text="E", bold=True, font_size=sp(20),
                              size_hint=(None, None), size=(dp(42), dp(42)))
+        avatar.bind(on_release=lambda *_: self.app.open_models())
         titles = BoxLayout(orientation="vertical")
-        self.title = Label(text="Qwen", bold=True, font_size=sp(17), halign="left", valign="bottom")
+        self.title = Label(text="Erald Bot", bold=True, font_size=sp(17), halign="left", valign="bottom")
         self.status = Label(text="starting...", font_size=sp(12), color=(1, 1, 1, 0.8),
-                            halign="left", valign="top")
+                            halign="left", valign="top", shorten=True, shorten_from="right")
         for label in (self.title, self.status):
             label.bind(size=lambda w, _: setattr(w, "text_size", w.size))
             titles.add_widget(label)
         new_chat = RoundButton(hex_color("#128C7E"), text="New", font_size=sp(13),
                                size_hint=(None, None), size=(dp(42), dp(42)))
         new_chat.bind(on_release=lambda *_: self.app.new_chat())
+        models = PillButton(hex_color("#128C7E"), text="Models", size_hint=(None, None), size=(dp(72), dp(42)))
+        models.bind(on_release=lambda *_: self.app.open_models())
         header.add_widget(avatar)
         header.add_widget(titles)
+        header.add_widget(models)
         header.add_widget(new_chat)
 
         # Messages
@@ -915,7 +1211,10 @@ class ChatScreen(BoxLayout):
         self.send_button = RoundButton(SEND_GREEN, text="Send", bold=True, font_size=sp(13),
                                        size_hint=(None, None), size=(dp(44), dp(44)))
         self.send_button.bind(on_release=lambda *_: self.app.send_or_stop())
+        self.mic_button = MicButton(hex_color("#128C7E"), size_hint=(None, None), size=(dp(44), dp(44)))
+        self.mic_button.bind(on_release=lambda *_: self.app.start_voice_input())
         bar.add_widget(self.input)
+        bar.add_widget(self.mic_button)
         bar.add_widget(self.send_button)
         self.bar = bar
 
@@ -979,7 +1278,7 @@ class ChatScreen(BoxLayout):
 
 
 class QwenChatApp(App):
-    title = "Qwen Bot"
+    title = "Erald Bot"
 
     def build(self):
         Window.clearcolor = CHAT_BACKGROUND
@@ -989,6 +1288,8 @@ class QwenChatApp(App):
         self.reply_bubble = None
         self.generating = False
         self.clear_after_reply = False
+        self.downloads = {}      # file -> {"progress": (done, total), "cancel": Event}
+        self.menu = None
         self.screen = ChatScreen(self)
         self.safe_area = SafeArea()
         if self.safe_area.available or self.safe_area.simulated:
@@ -1011,25 +1312,28 @@ class QwenChatApp(App):
     def load_model(self):
         path = find_model()
         if path is None and IS_ANDROID:
-            folder = external_model_dir() or "Android/data/<package>/files"
-            self.screen.status.text = "no model found"
-            self.screen.add_bubble(
-                "No model file found.\n\nCopy a .gguf model (e.g. qwen2.5-1.5b-instruct-q4_k_m.gguf) "
-                f"into this folder with a USB cable, then restart the app:\n{folder}", False, notice=True)
+            self.screen.status.text = "no model - tap Models"
+            self.screen.add_bubble("No model on the phone yet. Tap Models and download one.", False, notice=True)
+            self.open_models()
             return
+        self.start_loading(path)
+
+    def start_loading(self, path):
         size_mb = os.path.getsize(path) // (1024 * 1024) if path else 0
         free_mb = available_memory_mb()
         if free_mb is not None and size_mb and free_mb < size_mb + 600:
             self.screen.add_bubble(
                 f"Low memory: {free_mb} MB free, the model needs about {size_mb + 400} MB. "
                 "Close other apps if the chat crashes.", False, notice=True)
-        self.screen.status.text = "loading model..."
+        self.screen.status.text = f"loading {model_name(path)}..."
         self.engine.load(path, self.on_model_ready, self.on_model_error)
 
     @mainthread
     def on_model_ready(self, system_info, memory):
         name = os.path.basename(self.engine.model_path or "demo")
-        self.screen.status.text = "online - offline model"
+        self.screen.status.text = self.online_status()
+        if self.menu:
+            self.menu.refresh()
         print(f"[QwenChat] model {name} loaded - context {self.engine.n_ctx} - memory {memory} - {system_info}")
         if self.engine.n_ctx < N_CTX:
             self.screen.add_bubble(
@@ -1057,6 +1361,134 @@ class QwenChatApp(App):
             gc.collect()
             print(f"[QwenChat] low memory (app {own} MB, system free {free} MB) - "
                   f"removed {removed} old bubbles")
+
+    # ---- voice typing ------------------------------------------------------------------------
+
+    VOICE_REQUEST = 4711
+
+    def start_voice_input(self):
+        """
+        Opens Android's speech recognizer (the "Speak now" screen from Google / the phone maker).
+        It records and recognizes the speech itself, so this app needs no microphone permission.
+        The recognized words are added to the message box, to check before sending.
+        """
+        if not IS_ANDROID:
+            self.screen.add_bubble("Voice typing works on the phone only.", False, notice=True)
+            return
+        try:
+            from jnius import autoclass
+            from android import activity
+            Intent = autoclass("android.content.Intent")
+            RecognizerIntent = autoclass("android.speech.RecognizerIntent")
+            intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+            intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            intent.putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak now")
+            if not getattr(self, "voice_bound", False):
+                activity.bind(on_activity_result=self.on_activity_result)
+                self.voice_bound = True
+            android_context().startActivityForResult(intent, self.VOICE_REQUEST)
+        except Exception as e:  # ActivityNotFoundException: no speech recognizer on the phone
+            print(f"[QwenChat] voice input failed: {e}")
+            self.screen.add_bubble(
+                "Voice typing isn't available. Install or update the \"Google\" app or "
+                "\"Speech Services by Google\" from the Play Store, then try again.", False, notice=True)
+
+    def on_activity_result(self, request_code, result_code, data):
+        # Called on Android's UI thread, not Kivy's
+        if request_code != self.VOICE_REQUEST:
+            return
+        text = ""
+        if result_code == -1 and data is not None:  # Activity.RESULT_OK
+            try:
+                from jnius import autoclass
+                RecognizerIntent = autoclass("android.speech.RecognizerIntent")
+                results = data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
+                if results is not None and results.size() > 0:
+                    text = results.get(0)
+            except Exception as e:
+                print(f"[QwenChat] voice result failed: {e}")
+        self.insert_voice_text(text)
+
+    @mainthread
+    def insert_voice_text(self, text):
+        if not text:
+            return
+        current = self.screen.input.text.rstrip()
+        self.screen.input.text = f"{current} {text}" if current else text
+        self.screen.input.do_cursor_movement("cursor_end", control=True)  # cursor after the new words
+
+    def online_status(self):
+        return f"online - {model_name(self.engine.model_path)}"
+
+    # ---- models menu -------------------------------------------------------------------------
+
+    def open_models(self):
+        if self.menu is None:
+            self.menu = ModelsMenu(self)
+            self.menu.bind(on_dismiss=lambda *_: setattr(self, "menu", None))
+            self.menu.open()
+
+    def switch_model(self, path):
+        if self.menu:
+            self.menu.dismiss()
+        if path == self.engine.model_path and self.engine.ready:
+            return
+        save_settings(model=os.path.basename(path))
+        if self.generating:
+            self.engine.stop()
+        self.new_chat()  # another model can't continue this chat's cached tokens
+        self.screen.add_bubble(f"Switched to {model_name(path)}.", False, notice=True)
+        self.start_loading(path)
+
+    def delete_model(self, path):
+        if path == self.engine.model_path:
+            return
+        try:
+            os.remove(path)
+        except OSError as e:
+            self.screen.add_bubble(f"Could not delete {model_name(path)}: {e}", False, notice=True)
+        if self.menu:
+            self.menu.refresh()
+
+    def start_download(self, model):
+        if model["file"] in self.downloads:
+            return
+        cancel = threading.Event()
+        state = {"progress": (0, model["size"]), "cancel": cancel}
+        self.downloads[model["file"]] = state
+
+        def progress(done, total):
+            state["progress"] = (done, total)
+
+        def run():
+            try:
+                path = download_model(model, progress, cancel)
+                self.download_finished(model, path, None)
+            except Exception as e:
+                self.download_finished(model, None, str(e))
+        threading.Thread(target=run, daemon=True).start()
+        if self.menu:
+            self.menu.refresh()
+
+    def cancel_download(self, model):
+        state = self.downloads.get(model["file"])
+        if state:
+            state["cancel"].set()
+
+    @mainthread
+    def download_finished(self, model, path, error):
+        self.downloads.pop(model["file"], None)
+        if error == "cancelled":
+            pass
+        elif error:
+            self.screen.add_bubble(f"Download of {model['name']} failed: {error}", False, notice=True)
+        else:
+            self.screen.add_bubble(f"{model['name']} downloaded. Tap Models > Use to switch to it.",
+                                   False, notice=True)
+            if not self.engine.model_path:  # first model on a phone that had none
+                self.switch_model(path)
+        if self.menu:
+            self.menu.refresh()
 
     @mainthread
     def on_model_error(self, error):
@@ -1108,7 +1540,7 @@ class QwenChatApp(App):
         self.finish_reply(partial_text)
         if not error.startswith("stopped"):
             self.screen.add_bubble(f"Error: {error}", False, notice=True)
-        self.screen.status.text = "online - offline model"
+        self.screen.status.text = self.online_status()
 
     def finish_reply(self, text):
         if text.strip():
@@ -1135,7 +1567,7 @@ class QwenChatApp(App):
         self.screen.messages.clear_widgets()
         self.engine.reset()  # clears the KV cache
         gc.collect()         # and releases the old bubbles' textures
-        self.screen.status.text = "online - offline model" if self.engine.ready else self.screen.status.text
+        self.screen.status.text = self.online_status() if self.engine.ready else self.screen.status.text
 
     # ---- lifecycle ---------------------------------------------------------------------------
 
