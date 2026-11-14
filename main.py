@@ -115,6 +115,9 @@ MODELS = [
     {"name": "Qwen2.5 Coder 1.5B", "about": "Programming and code",
      "file": "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf", "size": 1117320768,
      "url": HF + "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"},
+    {"name": "Qwen3 1.7B", "about": "Newest Qwen, smarter answers",
+     "file": "Qwen3-1.7B-Q4_K_M.gguf", "size": 1107409472,
+     "url": HF + "unsloth/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_K_M.gguf"},
     {"name": "SmolLM2 1.7B", "about": "English chat, by Hugging Face",
      "file": "smollm2-1.7b-instruct-q4_k_m.gguf", "size": 1055609536,
      "url": HF + "HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF/resolve/main/smollm2-1.7b-instruct-q4_k_m.gguf"},
@@ -408,18 +411,39 @@ class DemoBridge:
         pass
 
 
-def chatml(messages):
+# Qwen3 first "thinks" out loud inside <think>...</think>, which on a phone means a minute of
+# hidden text before the answer. An empty think block after "assistant" switches that off (the same
+# thing Qwen's own chat template does for enable_thinking=False).
+THINK_OFF = "<think>\n\n</think>\n\n"
+
+
+def needs_think_off(path):
+    return "qwen3" in os.path.basename(path or "").lower()
+
+
+def strip_thinking(text):
+    """Hides <think>...</think> text if a model writes it anyway (unfinished: hide the rest)."""
+    if "<think>" not in text:
+        return text
+    return re.sub(r"<think>.*?(</think>\s*|$)", "", text, flags=re.S)
+
+
+def chatml(messages, no_think=False):
     """
     Qwen's chat format. messages: [{"role": "user" | "assistant", "content": str}].
+    no_think: Qwen3 - every assistant turn starts with an empty think block (past turns too, so the
+    prompt keeps matching the tokens already in the KV cache).
     """
+    think = THINK_OFF if no_think else ""
     def clean(text):
         # A user typing "<|im_end|>" must not be able to inject control tokens
         return text.replace("<|", "<​|")
 
     parts = [f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"]
     for message in messages:
-        parts.append(f"<|im_start|>{message['role']}\n{clean(message['content'])}<|im_end|>\n")
-    parts.append("<|im_start|>assistant\n")
+        prefix = think if message["role"] == "assistant" else ""
+        parts.append(f"<|im_start|>{message['role']}\n{prefix}{clean(message['content'])}<|im_end|>\n")
+    parts.append("<|im_start|>assistant\n" + think)
     return "".join(parts)
 
 
@@ -607,6 +631,7 @@ class ChatEngine:
         self.ready = False
         self.model_path = None
         self.n_ctx = N_CTX
+        self.no_think = False  # Qwen3: switch its thinking off (see THINK_OFF)
         self.mapped_mb = 0  # model weights that are file-backed (not copied into RAM), worst case
         threading.Thread(target=self._run, daemon=True).start()
 
@@ -631,6 +656,7 @@ class ChatEngine:
                     if IS_ANDROID:
                         raise
                     self.bridge = DemoBridge()  # desktop without the native library: UI demo
+                self.no_think = needs_think_off(path)
                 memory = self._load_within_budget(path or "")
                 self.model_path = path
                 self.ready = True
@@ -653,7 +679,7 @@ class ChatEngine:
             self.n_ctx = n_ctx
             # Warm-up: evaluating the system prompt now makes the first reply faster (it is cached),
             # and touches the compute buffers so the measurement below is real
-            self.bridge.start(chatml([]), TEMPERATURE, TOP_P, TOP_K, REPEAT_PENALTY, 0)
+            self.bridge.start(chatml([], self.no_think), TEMPERATURE, TOP_P, TOP_K, REPEAT_PENALTY, 0)
             memory = process_memory_mb()
             if memory is None:  # no /proc (desktop): nothing to measure
                 return {"n_ctx": n_ctx}
@@ -687,13 +713,13 @@ class ChatEngine:
         """
         budget = self.n_ctx - self.reply_reserve() - 16
         kept = list(messages)
-        prompt = chatml(kept)
+        prompt = chatml(kept, self.no_think)
         if self.bridge.count_tokens(prompt) <= budget:
             return prompt, kept
         target = int(budget * TRIM_TARGET)
         while len(kept) > 1:
             kept = kept[2:] if len(kept) > 2 else kept[1:]  # drop the oldest question + answer
-            prompt = chatml(kept)
+            prompt = chatml(kept, self.no_think)
             if self.bridge.count_tokens(prompt) <= target:
                 break
         return prompt, kept
@@ -1155,7 +1181,7 @@ class Bubble(BoxLayout):
         self.background.pos, self.background.size = self.box.pos, self.box.size
 
     def set_text(self, text):
-        text = latex_to_text(text)
+        text = latex_to_text(strip_thinking(text)).strip()
         self.raw_text = text
         self.label.font_name = font_for(text)
         self.label.text = to_markup(text) if text else "..."
