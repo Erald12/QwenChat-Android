@@ -294,6 +294,7 @@ class ChatEngine:
         self.ready = False
         self.model_path = None
         self.n_ctx = N_CTX
+        self.mapped_mb = 0  # model weights that are file-backed (not copied into RAM), worst case
         threading.Thread(target=self._run, daemon=True).start()
 
     def _run(self):
@@ -326,7 +327,9 @@ class ChatEngine:
         reloads with half the context. Returns the measurement ({"estimate_mb", "n_ctx", ...}).
         """
         model_mb = os.path.getsize(path) // (1024 * 1024) if path and os.path.exists(path) else 0
+        before = process_memory_mb()
         n_ctx = N_CTX
+        previous_anon = None
         while True:
             self.bridge.load(path, n_ctx, N_THREADS, N_THREADS_BATCH, N_BATCH)
             self.n_ctx = n_ctx
@@ -336,12 +339,26 @@ class ChatEngine:
             memory = process_memory_mb()
             if memory is None:  # no /proc (desktop): nothing to measure
                 return {"n_ctx": n_ctx}
-            # Worst case: every page of the memory-mapped weights resident at once
-            estimate = memory["anon"] + model_mb
+            # Worst case: every page of the memory-mapped weights resident at once. But if loading
+            # grew the anonymous memory by most of the model's size, llama.cpp copied the weights
+            # into RAM (e.g. repacked them for ARM) and they are already counted in "anon".
+            grown = memory["anon"] - (before["anon"] if before else 0)
+            mapped_mb = 0 if grown > model_mb // 2 else model_mb
+            self.mapped_mb = mapped_mb
+            estimate = memory["anon"] + mapped_mb
             memory.update(n_ctx=n_ctx, model_mb=model_mb, estimate_mb=estimate)
             if estimate <= MEMORY_BUDGET_MB or n_ctx <= MIN_CTX:
                 return memory
+            # The context is a small part of the memory (56 MB of KV cache at 2048): stop shrinking
+            # it once halving no longer saves anything worthwhile
+            if previous_anon is not None and previous_anon - memory["anon"] < 32:
+                return memory
+            previous_anon = memory["anon"]
             n_ctx //= 2
+
+    def reply_reserve(self):
+        """Tokens kept free for the reply: MAX_REPLY_TOKENS, but never more than a quarter of a small context."""
+        return min(MAX_REPLY_TOKENS, self.n_ctx // 4)
 
     def fit_history(self, messages):
         """
@@ -350,7 +367,7 @@ class ChatEngine:
         messages. The bridge then shifts the KV cache instead of re-reading the whole chat.
         Returns (prompt, messages that were kept).
         """
-        budget = self.n_ctx - MAX_REPLY_TOKENS - 16
+        budget = self.n_ctx - self.reply_reserve() - 16
         kept = list(messages)
         prompt = chatml(kept)
         if self.bridge.count_tokens(prompt) <= budget:
@@ -375,7 +392,7 @@ class ChatEngine:
             text = ""
             try:
                 prompt, kept = self.fit_history(messages)
-                if self.bridge.count_tokens(prompt) > self.n_ctx - MAX_REPLY_TOKENS - 16:
+                if self.bridge.count_tokens(prompt) > self.n_ctx - self.reply_reserve() - 16:
                     raise RuntimeError("Your message is too long for the model's context.")
                 started = time.time()
                 prompt_tokens = self.bridge.start(prompt, TEMPERATURE, TOP_P, TOP_K, REPEAT_PENALTY,
@@ -388,7 +405,8 @@ class ChatEngine:
                 generated = 0
                 gen_started = time.time()
                 last_push = 0.0
-                while generated < MAX_REPLY_TOKENS and not self.stop_requested.is_set():
+                max_tokens = self.n_ctx - self.bridge.cached_tokens() - 8  # never overflow the context
+                while generated < min(MAX_REPLY_TOKENS, max_tokens) and not self.stop_requested.is_set():
                     piece = self.bridge.next()
                     if piece is None:
                         break
@@ -877,7 +895,10 @@ class QwenChatApp(App):
         """
         memory = process_memory_mb()
         free = available_memory_mb()
-        own = memory["anon"] + memory.get("file", 0) if memory else 0
+        # Same worst case as at load: own RAM plus the weights still read from the mapped file.
+        # RssFile itself isn't used: after llama.cpp repacks the weights into RAM, the file pages
+        # it read stay resident but Android can drop them at any time.
+        own = memory["anon"] + self.engine.mapped_mb if memory else 0
         if (memory and own > MEMORY_BUDGET_MB) or (free is not None and free < LOW_SYSTEM_MEMORY_MB):
             removed = self.screen.prune_bubbles(BUBBLES_UNDER_PRESSURE)
             gc.collect()
