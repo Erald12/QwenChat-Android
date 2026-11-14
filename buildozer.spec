@@ -1,6 +1,6 @@
 [app]
 
-title = Qwen Chat
+title = Qwen Bot
 package.name = qwenchat
 package.domain = org.offlineai
 version = 1.0
@@ -9,7 +9,7 @@ source.dir = .
 # gguf: the model the GitHub workflow downloads into models/ is packed into the APK
 source.include_exts = py,png,jpg,kv,json,gguf
 # Build inputs that must NOT end up inside the APK's Python files
-source.exclude_dirs = native,libs,model-cache,.github,.git,bin,.buildozer,tests,__pycache__
+source.exclude_dirs = native,tools,libs,model-cache,.github,.git,bin,.buildozer,tests,__pycache__
 
 # python-for-android recipes. "android" + "pyjnius" give access to Android APIs (storage folders,
 # native library dir). llama.cpp is NOT a requirement here: it is built separately with the NDK
@@ -19,6 +19,10 @@ requirements = python3,kivy,pyjnius,android
 orientation = portrait
 fullscreen = 0
 android.presplash_color = #075E54
+# App icon (launcher, 512x512) and the start screen shown while the app loads (800x800).
+# Both are drawn by tools/make_logo.py.
+icon.filename = %(source.dir)s/assets/icon.png
+presplash.filename = %(source.dir)s/assets/presplash.png
 
 # No permissions at all - the app never touches the network. A model you copy yourself goes into
 # Android/data/org.offlineai.qwenchat/files, which the app can read without any permission.

@@ -826,7 +826,7 @@ class ChatScreen(BoxLayout):
 
 
 class QwenChatApp(App):
-    title = "Qwen Chat"
+    title = "Qwen Bot"
 
     def build(self):
         Window.clearcolor = CHAT_BACKGROUND
