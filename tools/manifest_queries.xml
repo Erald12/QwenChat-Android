@@ -1,0 +1,11 @@
+<!-- Added to AndroidManifest.xml by buildozer (android.extra_manifest_xml).
+     Android 11+ hides other apps' services unless declared here: without these, the app can't
+     find the text-to-speech engine (speaker button) or the speech recognizer (mic button). -->
+<queries>
+    <intent>
+        <action android:name="android.intent.action.TTS_SERVICE" />
+    </intent>
+    <intent>
+        <action android:name="android.speech.action.RECOGNIZE_SPEECH" />
+    </intent>
+</queries>

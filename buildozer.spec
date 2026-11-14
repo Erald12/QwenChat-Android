@@ -27,6 +27,8 @@ presplash.filename = %(source.dir)s/assets/presplash.png
 # INTERNET is used only by the Models menu, to download a model once. Chatting is fully offline.
 # Models are stored in Android/data/org.offlineai.qwenchat/files (no storage permission needed).
 android.permissions = INTERNET
+# Lets the app find Android's text-to-speech engine and speech recognizer (see the file)
+android.extra_manifest_xml = ./tools/manifest_queries.xml
 
 # ---- Android SDK / NDK ---------------------------------------------------------------------------
 android.api = 35

@@ -570,6 +570,28 @@ def latex_to_text(text):
     return "```".join(parts)
 
 
+
+def speech_text(text):
+    """What to read aloud: the message without markdown marks, and code blocks left out."""
+    text = re.sub(r"```.*?(```|$)", " (code) ", text, flags=re.S)
+    text = re.sub(r"^\s*(#+|[-*]|\d+\.)\s+", "", text, flags=re.M)  # headings, bullets, numbers
+    text = text.replace("**", "").replace("`", "").replace("__", "")
+    return re.sub(r"[ \t]+", " ", text).strip()
+
+
+def split_for_speech(text, limit):
+    """Splits long text at sentence or line ends into pieces of at most `limit` characters."""
+    pieces = []
+    while len(text) > limit:
+        cut = max(text.rfind(mark, 0, limit) for mark in (". ", "\n", "! ", "? "))
+        cut = cut + 1 if cut > limit // 2 else limit
+        pieces.append(text[:cut].strip())
+        text = text[cut:]
+    if text.strip():
+        pieces.append(text.strip())
+    return pieces or [""]
+
+
 class ChatEngine:
     """
     Runs the model on one background thread so the UI never freezes.
@@ -755,7 +777,7 @@ from kivy.app import App  # noqa: E402
 from kivy.clock import Clock, mainthread  # noqa: E402
 from kivy.core.text import Label as CoreLabel  # noqa: E402
 from kivy.core.window import Window  # noqa: E402
-from kivy.graphics import Color, Ellipse, Line, Rectangle, RoundedRectangle  # noqa: E402
+from kivy.graphics import Color, Ellipse, Line, Quad, Rectangle, RoundedRectangle  # noqa: E402
 from kivy.metrics import dp, sp  # noqa: E402
 from kivy.uix.behaviors import ButtonBehavior  # noqa: E402
 from kivy.uix.boxlayout import BoxLayout  # noqa: E402
@@ -938,6 +960,32 @@ class MicButton(RoundButton):
         self.base.points = [cx - dp(4.5), cy - dp(9), cx + dp(4.5), cy - dp(9)]
 
 
+class SpeakerButton(ButtonBehavior, Widget):
+    """Small speaker icon under a bot message: grey, or green while that message is being read."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        with self.canvas:
+            self.color = Color(*TIME_COLOR)
+            self.box = Rectangle()
+            self.cone = Quad()
+            self.wave1 = Line(width=dp(1.2))
+            self.wave2 = Line(width=dp(1.2))
+        self.bind(pos=self._redraw, size=self._redraw)
+
+    def _redraw(self, *_):
+        cx, cy = self.center_x - dp(3), self.center_y
+        self.box.pos, self.box.size = (cx - dp(6), cy - dp(2.5)), (dp(3), dp(5))
+        self.cone.points = [cx - dp(3), cy - dp(2.5), cx + dp(2), cy - dp(6.5),
+                            cx + dp(2), cy + dp(6.5), cx - dp(3), cy + dp(2.5)]
+        # sound waves: arcs on the right (Kivy angles: 0 = top, clockwise)
+        self.wave1.ellipse = (cx - dp(2), cy - dp(4), dp(8), dp(8), 50, 130)
+        self.wave2.ellipse = (cx - dp(5.5), cy - dp(7.5), dp(15), dp(15), 50, 130)
+
+    def set_active(self, active):
+        self.color.rgba = SEND_GREEN if active else TIME_COLOR
+
+
 class PillButton(ButtonBehavior, Label):
     """Rounded-rectangle button (RoundButton is a circle, too small for words like "Download")."""
 
@@ -1066,6 +1114,8 @@ class Bubble(BoxLayout):
     with the time in the corner.
     """
 
+    SPEAKER_WIDTH = dp(30)
+
     def __init__(self, text, mine, notice=False, **kwargs):
         super().__init__(size_hint_y=None, padding=(dp(10), dp(2)), **kwargs)
         self.mine = mine
@@ -1083,8 +1133,15 @@ class Bubble(BoxLayout):
                           size_hint=(None, None), halign="right", valign="bottom")
         self.time.texture_update()
         self.time_width = self.time.texture_size[0]  # measured once - text_size changes it later
+        self.footer = BoxLayout(size_hint=(None, None))
+        self.speaker = None
+        if not mine and not notice:  # bot replies can be read aloud
+            self.speaker = SpeakerButton(size_hint=(None, 1), width=self.SPEAKER_WIDTH)
+            self.speaker.bind(on_release=lambda *_: App.get_running_app().toggle_speech(self))
+            self.footer.add_widget(self.speaker)
+        self.footer.add_widget(self.time)
         self.box.add_widget(self.label)
-        self.box.add_widget(self.time)
+        self.box.add_widget(self.footer)
         if mine:
             self.add_widget(Widget())
             self.add_widget(self.box)
@@ -1122,10 +1179,13 @@ class Bubble(BoxLayout):
         self.label.text_size = (text_width, None)
         self.label.texture_update()
         self.label.size = self.label.texture_size
-        bubble_width = max(self.label.width, self.time_width + dp(4))
-        self.time.size = (bubble_width, self.time.texture_size[1])
+        speaker_width = self.SPEAKER_WIDTH if self.speaker else 0
+        bubble_width = max(self.label.width, self.time_width + dp(4) + speaker_width)
+        footer_height = dp(24) if self.speaker else self.time.texture_size[1]  # room to tap the speaker
+        self.footer.size = (bubble_width, footer_height)
+        self.time.size = (bubble_width - speaker_width, footer_height)
         self.time.text_size = self.time.size
-        self.box.size = (bubble_width + BUBBLE_PADDING_X * 2, self.label.height + self.time.height + dp(11))
+        self.box.size = (bubble_width + BUBBLE_PADDING_X * 2, self.label.height + footer_height + dp(11))
         self.height = self.box.height + dp(4)
 
 
@@ -1289,6 +1349,10 @@ class QwenChatApp(App):
         self.generating = False
         self.clear_after_reply = False
         self.downloads = {}      # file -> {"progress": (done, total), "cancel": Event}
+        self.tts = None          # Android TextToSpeech, created on first use
+        self.speaking_bubble = None
+        self.speech_watch = None
+        self.speech_started = 0.0
         self.menu = None
         self.screen = ChatScreen(self)
         self.safe_area = SafeArea()
@@ -1361,6 +1425,78 @@ class QwenChatApp(App):
             gc.collect()
             print(f"[QwenChat] low memory (app {own} MB, system free {free} MB) - "
                   f"removed {removed} old bubbles")
+
+    # ---- reading replies aloud ---------------------------------------------------------------
+
+    def toggle_speech(self, bubble):
+        """Speaker button: reads the message aloud, or stops if that message is being read."""
+        if self.speaking_bubble is bubble:
+            self.stop_speech()
+            return
+        self.stop_speech()
+        text = speech_text(bubble.raw_text)
+        if not text:
+            return
+        if not IS_ANDROID:
+            self.screen.add_bubble("Reading aloud works on the phone only.", False, notice=True)
+            return
+        try:
+            if self.tts is None:
+                from jnius import autoclass
+                TextToSpeech = autoclass("android.speech.tts.TextToSpeech")
+                # No init listener: speak() simply fails until the engine is ready, so retry below
+                self.tts = TextToSpeech(android_context(), None)
+        except Exception as e:
+            print(f"[QwenChat] text to speech failed: {e}")
+            self.speech_unavailable()
+            return
+        self.speaking_bubble = bubble
+        bubble.speaker.set_active(True)
+        self._speak(text, 0)
+
+    def _speak(self, text, attempt):
+        """Queues the text in pieces (Android reads at most 4000 characters per call)."""
+        if self.speaking_bubble is None:
+            return
+        from jnius import autoclass
+        TextToSpeech = autoclass("android.speech.tts.TextToSpeech")
+        pieces = split_for_speech(text, 3500)
+        result = self.tts.speak(pieces[0], TextToSpeech.QUEUE_FLUSH, None)
+        if result != TextToSpeech.SUCCESS:  # engine still starting (first use takes a moment)
+            if attempt < 20:
+                Clock.schedule_once(lambda dt: self._speak(text, attempt + 1), 0.25)
+            else:
+                self.stop_speech()
+                self.speech_unavailable()
+            return
+        for piece in pieces[1:]:
+            self.tts.speak(piece, TextToSpeech.QUEUE_ADD, None)
+        self.speech_started = time.time()
+        if self.speech_watch is None:
+            self.speech_watch = Clock.schedule_interval(lambda dt: self._watch_speech(), 0.5)
+
+    def _watch_speech(self):
+        # Turns the speaker icon grey again when Android has finished reading
+        if self.speaking_bubble is None or (time.time() - self.speech_started > 1 and not self.tts.isSpeaking()):
+            self.stop_speech()
+
+    def stop_speech(self):
+        if self.tts is not None:
+            try:
+                self.tts.stop()
+            except Exception:
+                pass
+        if self.speaking_bubble is not None and self.speaking_bubble.speaker:
+            self.speaking_bubble.speaker.set_active(False)
+        self.speaking_bubble = None
+        if self.speech_watch is not None:
+            self.speech_watch.cancel()
+            self.speech_watch = None
+
+    def speech_unavailable(self):
+        self.screen.add_bubble(
+            "Reading aloud isn't available. Install \"Speech Services by Google\" from the Play Store, "
+            "or choose a voice in Android Settings > Accessibility > Text-to-speech.", False, notice=True)
 
     # ---- voice typing ------------------------------------------------------------------------
 
@@ -1563,6 +1699,7 @@ class QwenChatApp(App):
             self.engine.stop()
             return
         self.clear_after_reply = False
+        self.stop_speech()
         self.history = []
         self.screen.messages.clear_widgets()
         self.engine.reset()  # clears the KV cache
@@ -1575,6 +1712,9 @@ class QwenChatApp(App):
         return True  # keep the model loaded while the app is in the background
 
     def on_stop(self):
+        self.stop_speech()
+        if self.tts is not None:
+            self.tts.shutdown()
         self.engine.shutdown()
 
 
