@@ -1,7 +1,7 @@
 # Qwen Chat — offline AI chat for Android
 
 A WhatsApp-style chat app that runs **Qwen2.5-Instruct** entirely on the phone's CPU. No internet, no
-account, no server. The APK doesn't even request the INTERNET permission.
+account, no server. The internet is used only to download a model from the in-app Models menu.
 
 Built for a **Vivo Y27** (MediaTek Helio G85, 6 GB RAM): Kivy UI, llama.cpp inference, and a GitHub
 Actions workflow that builds the APK on every push.

@@ -94,7 +94,7 @@ To choose a different model:
        go back and tap Install.
     4. Vivo or Google Play Protect may warn about an unknown app.
        Choose "More details" -> "Install anyway".
-       The app has no internet permission, so it can't send anything anywhere.
+       The app uses the internet only to download models in the Models menu. Your chats never leave the phone.
 
 Updating later:
     Install the new APK the same way - it replaces the old app.

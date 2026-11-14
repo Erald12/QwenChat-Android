@@ -1,6 +1,6 @@
 [app]
 
-title = Qwen Bot
+title = Erald Bot
 package.name = qwenchat
 package.domain = org.offlineai
 version = 1.0
@@ -12,9 +12,9 @@ source.include_exts = py,png,jpg,kv,json,gguf
 source.exclude_dirs = native,tools,libs,model-cache,.github,.git,bin,.buildozer,tests,__pycache__
 
 # python-for-android recipes. "android" + "pyjnius" give access to Android APIs (storage folders,
-# native library dir). llama.cpp is NOT a requirement here: it is built separately with the NDK
+# native library dir). certifi: CA certificates for HTTPS model downloads. llama.cpp is NOT a requirement here: it is built separately with the NDK
 # (native/build_android.sh) and added below as a prebuilt .so.
-requirements = python3,kivy,pyjnius,android
+requirements = python3,kivy,pyjnius,android,certifi
 
 orientation = portrait
 fullscreen = 0
@@ -24,9 +24,9 @@ android.presplash_color = #075E54
 icon.filename = %(source.dir)s/assets/icon.png
 presplash.filename = %(source.dir)s/assets/presplash.png
 
-# No permissions at all - the app never touches the network. A model you copy yourself goes into
-# Android/data/org.offlineai.qwenchat/files, which the app can read without any permission.
-# android.permissions = (none)
+# INTERNET is used only by the Models menu, to download a model once. Chatting is fully offline.
+# Models are stored in Android/data/org.offlineai.qwenchat/files (no storage permission needed).
+android.permissions = INTERNET
 
 # ---- Android SDK / NDK ---------------------------------------------------------------------------
 android.api = 35

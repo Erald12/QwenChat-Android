@@ -1,4 +1,5 @@
-"""Draws the Qwen Bot robot icon (512x512) and start screen (800x800) as PNGs, pure Python."""
+"""Usage: python3 tools/make_logo.py assets ["Erald Bot"]
+Draws the robot icon (512x512) and start screen (800x800) as PNGs, pure Python."""
 import math, struct, sys, zlib
 
 # ---- signed distance shapes (y points down) ----
@@ -50,6 +51,11 @@ GLYPHS = {
     "e": (0.72, lambda: [("a", .36, -.36, .36, 45, 360), ("l", 0, -.36, .72, -.36)]),
     "n": (0.64, lambda: [("l", 0, -.72, 0, 0), ("a", .32, -.4, .32, 180, 360), ("l", .64, -.4, .64, 0)]),
     " ": (0.25, lambda: []),
+    "E": (0.52, lambda: [("l", 0, -1, 0, 0), ("l", 0, -1, .52, -1), ("l", 0, -.5, .44, -.5), ("l", 0, 0, .52, 0)]),
+    "r": (0.48, lambda: [("l", 0, -.72, 0, 0), ("a", .3, -.42, .3, 180, 300)]),
+    "a": (0.72, lambda: [("c", .36, -.36, .36), ("l", .72, -.72, .72, 0)]),
+    "l": (0.1, lambda: [("l", 0, -1, 0, 0)]),
+    "d": (0.72, lambda: [("c", .36, -.36, .36), ("l", .72, -1, .72, 0)]),
     "B": (0.62, lambda: [("l", 0, -1, 0, 0), ("l", 0, -1, .32, -1), ("l", 0, -.53, .34, -.53), ("l", 0, 0, .36, 0),
                          ("a", .32, -.765, .235, -90, 90), ("a", .36, -.265, .265, -90, 90)]),
     "o": (0.72, lambda: [("c", .36, -.36, .36)]),
@@ -98,4 +104,4 @@ TOP, BOT = (18, 140, 126), (7, 94, 84)
 grad = lambda S: (lambda x, y: tuple(TOP[i] + (BOT[i]-TOP[i])*y/S for i in range(3)))
 render(f"{out}/icon.png", 512, grad(512), robot(256, 328, 180))
 render(f"{out}/presplash.png", 800, lambda x, y: (7, 94, 84),
-       robot(400, 360, 200) + text("Qwen Bot", 400, 650, 84, [WHITE, GLOW]))
+       robot(400, 360, 200) + text(sys.argv[2] if len(sys.argv) > 2 else "Erald Bot", 400, 650, 84, [WHITE, GLOW]))
